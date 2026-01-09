@@ -1,0 +1,69 @@
+apiVersion: casbin.org/v1alpha1
+kind: CasbinPolicy
+metadata:
+  name: admin-data1-read
+  namespace: default
+spec:
+  ptype: p
+  rule:
+    - admin
+    - data1
+    - read
+---
+apiVersion: casbin.org/v1alpha1
+kind: CasbinPolicy
+metadata:
+  name: admin-data1-write
+  namespace: default
+spec:
+  ptype: p
+  rule:
+    - admin
+    - data1
+    - write
+---
+apiVersion: casbin.org/v1alpha1
+kind: CasbinPolicy
+metadata:
+  name: admin-data2-read
+  namespace: default
+spec:
+  ptype: p
+  rule:
+    - admin
+    - data2
+    - read
+---
+apiVersion: casbin.org/v1alpha1
+kind: CasbinPolicy
+metadata:
+  name: admin-data2-write
+  namespace: default
+spec:
+  ptype: p
+  rule:
+    - admin
+    - data2
+    - write
+---
+apiVersion: casbin.org/v1alpha1
+kind: CasbinPolicy
+metadata:
+  name: alice-admin-role
+  namespace: default
+spec:
+  ptype: g
+  rule:
+    - alice
+    - admin
+---
+apiVersion: casbin.org/v1alpha1
+kind: CasbinPolicy
+metadata:
+  name: bob-admin-role
+  namespace: default
+spec:
+  ptype: g
+  rule:
+    - bob
+    - admin
