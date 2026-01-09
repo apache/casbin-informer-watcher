@@ -33,15 +33,15 @@ import (
 
 // Watcher implements the persist.Watcher interface for Kubernetes CRD-based policy updates.
 type Watcher struct {
-	lock      sync.RWMutex
-	callback  func(string)
-	running   bool
-	localID   string
-	options   WatcherOptions
-	informer  cache.SharedIndexInformer
-	stopCh    chan struct{}
-	ctx       context.Context
-	cancel    context.CancelFunc
+	lock     sync.RWMutex
+	callback func(string)
+	running  bool
+	localID  string
+	options  WatcherOptions
+	informer cache.SharedIndexInformer
+	stopCh   chan struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 // UpdateType represents the type of policy update.

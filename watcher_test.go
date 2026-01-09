@@ -79,7 +79,7 @@ func TestNewWatcher(t *testing.T) {
 
 // TestNewWatcherWithOptions tests watcher creation with custom options.
 func TestNewWatcherWithOptions(t *testing.T) {
-	
+
 	client := createTestClient()
 
 	customID := "test-watcher-123"
@@ -108,7 +108,7 @@ func TestNewWatcherWithOptions(t *testing.T) {
 
 // TestSetUpdateCallback tests setting the update callback.
 func TestSetUpdateCallback(t *testing.T) {
-	
+
 	client := createTestClient()
 
 	watcher, err := NewWatcher(client, testGVR, "", WatcherOptions{})
@@ -134,7 +134,7 @@ func TestSetUpdateCallback(t *testing.T) {
 
 // TestUpdateMethods tests various update methods.
 func TestUpdateMethods(t *testing.T) {
-	
+
 	client := createTestClient()
 
 	w, err := NewWatcher(client, testGVR, "", WatcherOptions{})
@@ -184,7 +184,7 @@ func TestUpdateMethods(t *testing.T) {
 
 // TestConcurrency tests concurrent callback execution.
 func TestConcurrency(t *testing.T) {
-	
+
 	client := createTestClient()
 
 	w, err := NewWatcher(client, testGVR, "", WatcherOptions{})
@@ -223,7 +223,7 @@ func TestConcurrency(t *testing.T) {
 
 // TestHandleEvent tests event handling.
 func TestHandleEvent(t *testing.T) {
-	
+
 	client := createTestClient()
 
 	watcher, err := NewWatcher(client, testGVR, "", WatcherOptions{})
@@ -278,7 +278,7 @@ func TestHandleEvent(t *testing.T) {
 
 // TestIgnoreSelf tests the IgnoreSelf functionality.
 func TestIgnoreSelf(t *testing.T) {
-	
+
 	client := createTestClient()
 
 	localID := "test-id-123"
@@ -403,7 +403,7 @@ func TestMSGMarshaling(t *testing.T) {
 
 // TestClose tests watcher cleanup.
 func TestClose(t *testing.T) {
-	
+
 	client := createTestClient()
 
 	watcher, err := NewWatcher(client, testGVR, "", WatcherOptions{})
@@ -428,7 +428,7 @@ func TestClose(t *testing.T) {
 
 // TestUpdateAfterClose tests that updates fail after closing.
 func TestUpdateAfterClose(t *testing.T) {
-	
+
 	client := createTestClient()
 
 	w, err := NewWatcher(client, testGVR, "", WatcherOptions{})
