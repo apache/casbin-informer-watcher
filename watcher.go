@@ -39,6 +39,9 @@ type Watcher struct {
 	// mu protects the running state and callback
 	mu sync.RWMutex
 
+	// closeOnce ensures Close is only called once
+	closeOnce sync.Once
+
 	// namespace to watch (empty for all namespaces)
 	namespace string
 
@@ -159,16 +162,18 @@ func (w *Watcher) Update(msg string) error {
 
 // Close stops the watcher
 func (w *Watcher) Close() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.closeOnce.Do(func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
 
-	if !w.running {
-		return
-	}
+		if !w.running {
+			return
+		}
 
-	w.running = false
-	close(w.stopCh)
-	w.cancel()
+		w.running = false
+		close(w.stopCh)
+		w.cancel()
+	})
 }
 
 // Start begins watching for CRD changes

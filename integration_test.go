@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -275,7 +276,7 @@ func TestIntegration_ConcurrentPolicyUpdates(t *testing.T) {
 						"apiVersion": "casbin.org/v1alpha1",
 						"kind":       "CasbinPolicy",
 						"metadata": map[string]interface{}{
-							"name":      "policy-" + string(rune(goroutineID)) + "-" + string(rune(j)),
+							"name":      fmt.Sprintf("policy-%d-%d", goroutineID, j),
 							"namespace": "default",
 						},
 						"spec": map[string]interface{}{

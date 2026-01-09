@@ -7,8 +7,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/casbin/casbin/v2"
 	watcher "github.com/casbin/casbin-informer-watcher"
+	"github.com/casbin/casbin/v2"
 )
 
 func main() {
@@ -84,7 +84,7 @@ func testAuthorization(e *casbin.SyncedEnforcer) {
 			log.Printf("Error checking authorization for %s, %s, %s: %v", tc.sub, tc.obj, tc.act, err)
 			continue
 		}
-		
+
 		result := "DENIED"
 		if allowed {
 			result = "ALLOWED"

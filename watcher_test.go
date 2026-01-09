@@ -382,3 +382,40 @@ func TestWatcher_NoCallback(t *testing.T) {
 	w.onDelete(policy)
 	w.Update("test")
 }
+
+func TestWatcher_ConcurrentClose(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("Failed to add scheme: %v", err)
+	}
+
+	client := dynamicfake.NewSimpleDynamicClient(scheme)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	w := &Watcher{
+		client:  client,
+		stopCh:  make(chan struct{}),
+		running: true,
+		ctx:     ctx,
+		cancel:  cancel,
+	}
+
+	// Call Close concurrently from multiple goroutines
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.Close()
+		}()
+	}
+
+	// This should not panic or cause race conditions
+	wg.Wait()
+
+	// Verify watcher is closed
+	if w.running {
+		t.Error("Watcher should not be running after Close()")
+	}
+}
