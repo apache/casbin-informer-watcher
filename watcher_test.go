@@ -263,7 +263,7 @@ func TestHandleEvent(t *testing.T) {
 	}
 
 	// Handle the event
-	w.handleEvent(obj, "add")
+	w.handleEvent(obj, nil, "add")
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -318,7 +318,7 @@ func TestIgnoreSelf(t *testing.T) {
 		},
 	}
 
-	w.handleEvent(obj, "add")
+	w.handleEvent(obj, nil, "add")
 	time.Sleep(100 * time.Millisecond)
 
 	if callbackCalled {
@@ -442,5 +442,252 @@ func TestUpdateAfterClose(t *testing.T) {
 	err = watcher.Update()
 	if err == nil {
 		t.Error("Update should fail after Close()")
+	}
+}
+
+// TestHandleEventPolicyOperations verifies that Kubernetes policy events are
+// translated into the corresponding Casbin watcher operations.
+func TestHandleEventPolicyOperations(t *testing.T) {
+	client := createTestClient()
+
+	watcher, err := NewWatcher(client, testGVR, "", WatcherOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create watcher: %v", err)
+	}
+	defer watcher.Close()
+
+	w := watcher.(*Watcher)
+
+	tests := []struct {
+		name       string
+		eventType  string
+		oldPolicy  string
+		newPolicy  string
+		wantMethod UpdateType
+	}{
+		{
+			name:       "add policy",
+			eventType:  "add",
+			newPolicy:  "p, alice, data1, read",
+			wantMethod: UpdateForAddPolicy,
+		},
+		{
+			name:       "update policy",
+			eventType:  "update",
+			oldPolicy:  "p, alice, data1, read",
+			newPolicy:  "p, alice, data1, write",
+			wantMethod: UpdateForUpdatePolicy,
+		},
+		{
+			name:       "delete policy",
+			eventType:  "delete",
+			oldPolicy:  "p, alice, data1, read",
+			wantMethod: UpdateForRemovePolicy,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var received string
+			var mu sync.Mutex
+			done := make(chan struct{})
+
+			err := w.SetUpdateCallback(func(msg string) {
+				mu.Lock()
+				received = msg
+				mu.Unlock()
+
+				select {
+				case <-done:
+				default:
+					close(done)
+				}
+			})
+			if err != nil {
+				t.Fatalf("Failed to set callback: %v", err)
+			}
+
+			makeObject := func(policy string) *unstructured.Unstructured {
+				return &unstructured.Unstructured{
+					Object: map[string]interface{}{
+						"apiVersion": "casbin.org/v1",
+						"kind":       "Policy",
+						"metadata": map[string]interface{}{
+							"name":      "test-policy",
+							"namespace": "default",
+						},
+						"spec": map[string]interface{}{
+							"policy": policy,
+						},
+					},
+				}
+			}
+
+			var obj, oldObj interface{}
+
+			switch tt.eventType {
+			case "add":
+				obj = makeObject(tt.newPolicy)
+			case "update":
+				oldObj = makeObject(tt.oldPolicy)
+				obj = makeObject(tt.newPolicy)
+			case "delete":
+				oldObj = makeObject(tt.oldPolicy)
+				obj = oldObj
+			}
+
+			w.handleEvent(obj, oldObj, tt.eventType)
+
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("Timed out waiting for callback")
+			}
+
+			mu.Lock()
+			msg := received
+			mu.Unlock()
+
+			decoded := &MSG{}
+			if err := decoded.UnmarshalBinary([]byte(msg)); err != nil {
+				t.Fatalf("Failed to decode callback message: %v", err)
+			}
+
+			if decoded.Method != tt.wantMethod {
+				t.Errorf("Expected method %q, got %q", tt.wantMethod, decoded.Method)
+			}
+
+			if decoded.Sec != "p" {
+				t.Errorf("Expected section p, got %q", decoded.Sec)
+			}
+
+			if decoded.Ptype != "p" {
+				t.Errorf("Expected policy type p, got %q", decoded.Ptype)
+			}
+		})
+	}
+}
+
+// TestHandleEventMultiplePolicies verifies that a Kubernetes resource
+// containing multiple policy rules produces a batch watcher operation.
+func TestHandleEventMultiplePolicies(t *testing.T) {
+	client := createTestClient()
+
+	watcher, err := NewWatcher(client, testGVR, "", WatcherOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create watcher: %v", err)
+	}
+	defer watcher.Close()
+
+	w := watcher.(*Watcher)
+
+	var received string
+	done := make(chan struct{})
+
+	err = w.SetUpdateCallback(func(msg string) {
+		received = msg
+		close(done)
+	})
+	if err != nil {
+		t.Fatalf("Failed to set callback: %v", err)
+	}
+
+	obj := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "casbin.org/v1",
+			"kind":       "Policy",
+			"metadata": map[string]interface{}{
+				"name":      "batch-policy",
+				"namespace": "default",
+			},
+			"spec": map[string]interface{}{
+				"rules": []interface{}{
+					"p, alice, data1, read",
+					"p, bob, data2, write",
+				},
+			},
+		},
+	}
+
+	w.handleEvent(obj, nil, "add")
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out waiting for callback")
+	}
+
+	decoded := &MSG{}
+	if err := decoded.UnmarshalBinary([]byte(received)); err != nil {
+		t.Fatalf("Failed to decode callback message: %v", err)
+	}
+
+	if decoded.Method != UpdateForAddPolicies {
+		t.Errorf("Expected batch add method %q, got %q", UpdateForAddPolicies, decoded.Method)
+	}
+
+	if len(decoded.NewRules) != 2 {
+		t.Fatalf("Expected 2 rules, got %d", len(decoded.NewRules))
+	}
+
+	if decoded.NewRules[0][0] != "alice" || decoded.NewRules[1][0] != "bob" {
+		t.Errorf("Unexpected rules: %#v", decoded.NewRules)
+	}
+}
+
+// TestHandleEventFallsBackToFullUpdate verifies that an unparseable policy
+// change triggers a full watcher update instead of emitting an invalid
+// incremental operation.
+func TestHandleEventFallsBackToFullUpdate(t *testing.T) {
+	client := createTestClient()
+
+	watcher, err := NewWatcher(client, testGVR, "", WatcherOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create watcher: %v", err)
+	}
+	defer watcher.Close()
+
+	w := watcher.(*Watcher)
+
+	var received string
+	done := make(chan struct{})
+
+	err = w.SetUpdateCallback(func(msg string) {
+		received = msg
+		close(done)
+	})
+	if err != nil {
+		t.Fatalf("Failed to set callback: %v", err)
+	}
+
+	obj := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "casbin.org/v1",
+			"kind":       "Policy",
+			"metadata": map[string]interface{}{
+				"name":      "invalid-policy",
+				"namespace": "default",
+			},
+			"spec": map[string]interface{}{
+				"unexpected": "field",
+			},
+		},
+	}
+
+	w.handleEvent(obj, nil, "add")
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Timed out waiting for callback")
+	}
+
+	decoded := &MSG{}
+	if err := decoded.UnmarshalBinary([]byte(received)); err != nil {
+		t.Fatalf("Failed to decode callback message: %v", err)
+	}
+
+	if decoded.Method != Update {
+		t.Errorf("Expected full update method %q, got %q", Update, decoded.Method)
 	}
 }
