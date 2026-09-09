@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - master
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - master
@@ -37,30 +39,81 @@ jobs:
           flags: unittests
           name: codecov-umbrella
 
-  semantic-release:
+  release:
     needs: [test]
-    if: github.repository == 'casbin/casbin-informer-watcher' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+    if: github.repository == 'casbin/casbin-informer-watcher' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      issues: write
-      pull-requests: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 'lts/*'
-
-      - name: Install semantic-release
+      - name: Resolve version from tag
+        id: version
         run: |
-          npm install -g semantic-release @semantic-release/git @semantic-release/changelog @semantic-release/github
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Strip the leading "v": v1.4.0-rc1 -> 1.4.0-rc1
+          FULL_VERSION="${TAG#v}"
+          # Strip the RC suffix: 1.4.0-rc1 -> 1.4.0
+          BASE_VERSION="${FULL_VERSION%%-rc*}"
+          if [ "$FULL_VERSION" != "$BASE_VERSION" ]; then
+            IS_RC=true
+          else
+            IS_RC=false
+          fi
+          {
+            echo "tag=$TAG"
+            echo "full_version=$FULL_VERSION"
+            echo "base_version=$BASE_VERSION"
+            echo "is_rc=$IS_RC"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Run semantic-release
+      - name: Build Apache source release package
+        id: package
+        run: |
+          set -euo pipefail
+          BASE_VERSION="${{ steps.version.outputs.base_version }}"
+          NAME="apache-casbin-informer-watcher-${BASE_VERSION}-incubating-src"
+          mkdir -p dist
+          git archive --format=tar.gz \
+            --prefix="${NAME}/" \
+            -o "dist/${NAME}.tar.gz" \
+            "${GITHUB_REF_NAME}"
+          echo "file=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub pre-release (RC for Apache vote)
+        if: steps.version.outputs.is_rc == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: semantic-release
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.version.outputs.tag }}" \
+            "${{ steps.package.outputs.file }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --notes "Release candidate \`${{ steps.version.outputs.tag }}\` for Apache Casbin (Incubating) ${{ steps.version.outputs.base_version }}. The attached source package is the artifact to be signed and voted on; it is not a released version." \
+            --prerelease \
+            --verify-tag
+
+      - name: Publish GitHub release
+        if: steps.version.outputs.is_rc == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.version.outputs.tag }}" \
+            "${{ steps.package.outputs.file }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes \
+            --verify-tag
+
+      - name: Publish to Go module proxy
+        if: steps.version.outputs.is_rc == 'false'
+        run: |
+          set -euo pipefail
+          MODULE="github.com/casbin/casbin-informer-watcher"
+          curl --fail --silent --show-error --location --retry 5 --retry-delay 15 --retry-all-errors \
+            "https://proxy.golang.org/${MODULE}/@v/${{ steps.version.outputs.tag }}.info"
