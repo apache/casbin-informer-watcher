@@ -33,6 +33,13 @@ type WatcherOptions struct {
 	// Default is 30 seconds.
 	ResyncPeriod time.Duration
 
+	// IncrementalUpdate makes the watcher report the exact rules that changed
+	// instead of asking the enforcer to reload its whole policy. Leave it off
+	// when the enforcer's adapter is backed by the same resources the watcher
+	// observes: Casbin applies these messages through its Self* APIs, which
+	// write through to the adapter when AutoSave is enabled.
+	IncrementalUpdate bool
+
 	// OptionalUpdateCallback is an optional callback function that can be set during initialization.
 	OptionalUpdateCallback func(string)
 }

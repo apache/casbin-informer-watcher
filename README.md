@@ -130,9 +130,10 @@ func main() {
 
 	// Create watcher with custom options
 	options := informerwatcher.WatcherOptions{
-		LocalID:      "instance-1",          // Custom instance identifier
-		IgnoreSelf:   true,                  // Ignore updates from this instance
-		ResyncPeriod: 30 * time.Second,      // Resync period with API server
+		LocalID:           "instance-1",     // Custom instance identifier
+		IgnoreSelf:        true,             // Ignore updates from this instance
+		ResyncPeriod:      30 * time.Second, // Resync period with API server
+		IncrementalUpdate: true,             // Report the rules that changed instead of reloading
 	}
 
 	watcher, err := informerwatcher.NewWatcher(client, gvr, "default", options)
@@ -221,15 +222,67 @@ func main() {
 - **LocalID** (string): Unique identifier for this watcher instance. Auto-generated if not provided.
 - **IgnoreSelf** (bool): If true, ignores updates triggered by this watcher instance. Default: false.
 - **ResyncPeriod** (time.Duration): Period for the informer to resync with the API server. Default: 30 seconds.
-- **OptionalUpdateCallback** (func(string)): Optional callback function set during initialization.
+- **OptionalUpdateCallback** (func(string)): Optional callback function set during initialization. Equivalent to calling `SetUpdateCallback` right after `NewWatcher`, but it is in place before the first event arrives.
+- **IncrementalUpdate** (bool): If true, the watcher reports the exact rules that changed instead of asking the enforcer to reload its whole policy. Default: false. See [Update Modes](#update-modes).
 
 ## How It Works
 
 1. The watcher uses Kubernetes informers to monitor Custom Resource Definitions (CRDs) that represent Casbin policies.
-2. When a CRD is created, updated, or deleted, the informer triggers the corresponding event handler.
-3. The event handler processes the change and invokes the registered callback function.
-4. The callback typically triggers the enforcer to reload its policy or apply incremental updates.
+2. When a policy resource is created, updated, or deleted, the informer triggers the corresponding event handler.
+3. The event handler turns the change into one or more watcher messages and invokes the registered callback function.
+4. `DefaultUpdateCallback` applies each message to the enforcer, either by reloading the policy or by applying the incremental change.
 5. All running instances with the same watcher configuration receive the same updates, keeping policies synchronized.
+
+Three kinds of event carry no change and are dropped rather than reported:
+
+- The resources that already exist when the watcher starts. The informer replays them as create events while it builds its cache, but they describe the state the enforcer loaded through its own adapter.
+- The periodic resync, which re-delivers every cached resource. Kubernetes only bumps `resourceVersion` on a real write, so a resource that comes back with the same one has not changed.
+- Updates from this instance itself, when `IgnoreSelf` is enabled and the resource carries the `casbin.org/source-id` annotation with this watcher's `LocalID`.
+
+Deletions missed while the watch was down arrive as a tombstone rather than the resource itself; the watcher unwraps it and reports the deletion normally.
+
+## Update Modes
+
+By default, every observed change asks the enforcer for a full reload (the `Update` message). Reloading is idempotent, so instances cannot drift apart no matter how a resource was edited. This is the recommended mode when the enforcer's adapter reads the same resources the watcher observes.
+
+With `IncrementalUpdate` enabled, the watcher reads the rules out of the resource and reports only what changed:
+
+- A create or delete becomes an add or remove of the rules the resource carries, batched per section and policy type.
+- An edit is diffed: the rules that disappeared are removed and the rules that appeared are added. A resource that gains or loses a line is handled the same way as one whose lines were rewritten.
+- Anything that cannot be described this way — a resource that does not follow the layout below, or a malformed policy line — falls back to a full reload, so an unrecognized change is never silently dropped.
+
+Incremental mode requires policy resources to follow the [policy resource layout](#policy-resource-layout). Note that Casbin applies these messages through its `Self*` APIs, which write through to the adapter when `AutoSave` is enabled: if your adapter is backed by the same resources the watcher observes, keep the default reload mode so the observed change is not written straight back.
+
+## Policy Resource Layout
+
+In incremental mode the watcher reads rules from two `spec` fields. Both hold Casbin policy lines in the same format used in a policy CSV file, so the policy type comes first and the section is its first character (`p` and `p2` belong to section `p`, `g` and `g2` to section `g`). Blank lines and `#` comments are skipped.
+
+A single rule, or several newline-separated ones:
+
+```yaml
+apiVersion: casbin.org/v1
+kind: Policy
+metadata:
+  name: alice-can-read
+spec:
+  policy: "p, alice, data1, read"
+```
+
+Or a list:
+
+```yaml
+apiVersion: casbin.org/v1
+kind: Policy
+metadata:
+  name: team-policies
+spec:
+  policies:
+    - "p, alice, data1, read"
+    - "p, bob, data2, write"
+    - "g, alice, admin"
+```
+
+The default reload mode does not read these fields, and works with any resource layout.
 
 ## Supported Update Types
 
@@ -269,6 +322,10 @@ spec:
               properties:
                 policy:
                   type: string
+                policies:
+                  type: array
+                  items:
+                    type: string
   scope: Namespaced
   names:
     plural: policies

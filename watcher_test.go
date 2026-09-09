@@ -263,7 +263,7 @@ func TestHandleEvent(t *testing.T) {
 	}
 
 	// Handle the event
-	w.handleEvent(obj, "add")
+	w.handleEvent(eventAdd, nil, obj)
 
 	time.Sleep(100 * time.Millisecond)
 
@@ -318,7 +318,7 @@ func TestIgnoreSelf(t *testing.T) {
 		},
 	}
 
-	w.handleEvent(obj, "add")
+	w.handleEvent(eventAdd, nil, obj)
 	time.Sleep(100 * time.Millisecond)
 
 	if callbackCalled {

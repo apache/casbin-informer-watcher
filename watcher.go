@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"runtime"
 	"sync"
@@ -42,7 +43,23 @@ type Watcher struct {
 	stopCh   chan struct{}
 	ctx      context.Context
 	cancel   context.CancelFunc
+
+	// callbackMu serializes callback invocations so the enforcer sees changes
+	// in the order the informer reported them.
+	callbackMu sync.Mutex
 }
+
+// sourceIDAnnotation marks the watcher instance that wrote a policy resource.
+const sourceIDAnnotation = "casbin.org/source-id"
+
+// eventKind identifies the informer event being translated.
+type eventKind int
+
+const (
+	eventAdd eventKind = iota
+	eventUpdate
+	eventDelete
+)
 
 // UpdateType represents the type of policy update.
 type UpdateType string
@@ -97,7 +114,7 @@ func DefaultUpdateCallback(e casbin.IEnforcer) func(string) {
 		switch msgStruct.Method {
 		case Update, UpdateForSavePolicy:
 			err = e.LoadPolicy()
-			res = true
+			res = err == nil
 		case UpdateForAddPolicy:
 			res, err = e.SelfAddPolicy(msgStruct.Sec, msgStruct.Ptype, msgStruct.NewRule)
 		case UpdateForAddPolicies:
@@ -118,9 +135,10 @@ func DefaultUpdateCallback(e casbin.IEnforcer) func(string) {
 
 		if err != nil {
 			log.Println("Error updating policy:", err)
+			return
 		}
 		if !res {
-			log.Println("Callback update policy failed")
+			log.Println("Callback update policy had no effect")
 		}
 	}
 }
@@ -132,16 +150,21 @@ func finalizer(w *Watcher) {
 
 // NewWatcher creates a new Watcher instance.
 func NewWatcher(client dynamic.Interface, gvr schema.GroupVersionResource, namespace string, options WatcherOptions) (persist.Watcher, error) {
+	if client == nil {
+		return nil, errors.New("dynamic client cannot be nil")
+	}
+
 	initConfig(&options)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &Watcher{
-		running: true,
-		localID: options.LocalID,
-		options: options,
-		stopCh:  make(chan struct{}),
-		ctx:     ctx,
-		cancel:  cancel,
+		running:  true,
+		localID:  options.LocalID,
+		options:  options,
+		callback: options.OptionalUpdateCallback,
+		stopCh:   make(chan struct{}),
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 
 	// Create dynamic informer factory
@@ -158,13 +181,21 @@ func NewWatcher(client dynamic.Interface, gvr schema.GroupVersionResource, names
 	// Add event handlers
 	_, err := w.informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			w.handleEvent(obj, "add")
+			// Resources that already exist are replayed as adds while the
+			// cache is built; they are state the enforcer already loaded, not
+			// a change. HasSynced turns true just before the last replay, so a
+			// stray one may slip through - cheaper than gating any later and
+			// dropping a resource created moments after startup.
+			if !w.informer.HasSynced() {
+				return
+			}
+			w.handleEvent(eventAdd, nil, obj)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			w.handleEvent(newObj, "update")
+			w.handleEvent(eventUpdate, oldObj, newObj)
 		},
 		DeleteFunc: func(obj interface{}) {
-			w.handleEvent(obj, "delete")
+			w.handleEvent(eventDelete, obj, nil)
 		},
 	})
 	if err != nil {
@@ -187,44 +218,170 @@ func NewWatcher(client dynamic.Interface, gvr schema.GroupVersionResource, names
 	return w, nil
 }
 
-// handleEvent processes CRD events and triggers the callback.
-func (w *Watcher) handleEvent(obj interface{}, eventType string) {
+// handleEvent processes CRD events and triggers the callback. oldObj holds the
+// resource before the event and newObj after it, so an add has no oldObj and a
+// delete has no newObj.
+func (w *Watcher) handleEvent(kind eventKind, oldObj, newObj interface{}) {
 	w.lock.RLock()
+	running := w.running
 	callback := w.callback
 	w.lock.RUnlock()
 
-	if callback == nil {
+	if !running || callback == nil {
 		return
 	}
 
-	unstructuredObj, ok := obj.(*unstructured.Unstructured)
-	if !ok {
-		log.Println("Failed to convert object to unstructured")
+	old, err := asPolicyResource(oldObj)
+	if err != nil {
+		log.Println("Skipping event:", err)
 		return
 	}
 
-	// Extract policy update information from the CRD
-	msg := &MSG{
-		Method: Update,
-		ID:     w.localID,
+	current, err := asPolicyResource(newObj)
+	if err != nil {
+		log.Println("Skipping event:", err)
+		return
+	}
+
+	// A delete carries only the previous state of the resource.
+	subject := current
+	if subject == nil {
+		subject = old
+	}
+	if subject == nil {
+		return
 	}
 
 	// Check if this is our own update (if IgnoreSelf is enabled)
-	if w.options.IgnoreSelf {
-		annotations := unstructuredObj.GetAnnotations()
-		if annotations != nil {
-			if sourceID, ok := annotations["casbin.org/source-id"]; ok && sourceID == w.localID {
-				return
-			}
-		}
+	if w.options.IgnoreSelf && subject.GetAnnotations()[sourceIDAnnotation] == w.localID {
+		return
 	}
 
-	// Marshal and send message
+	// A resync re-delivers every cached resource as an update, and Kubernetes
+	// only bumps resourceVersion on a real write.
+	if kind == eventUpdate && old != nil && current != nil &&
+		old.GetResourceVersion() == current.GetResourceVersion() {
+		return
+	}
+
+	for _, msg := range w.buildMessages(kind, old, current) {
+		w.notify(callback, msg)
+	}
+}
+
+// asPolicyResource converts an object delivered by the informer, unwrapping the
+// tombstone Kubernetes sends when a deletion was missed while the watch was
+// down. A nil object stays nil: that side of the event does not exist.
+func asPolicyResource(obj interface{}) (*unstructured.Unstructured, error) {
+	if obj == nil {
+		return nil, nil
+	}
+
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+
+	resource, ok := obj.(*unstructured.Unstructured)
+	if !ok {
+		return nil, fmt.Errorf("unexpected object type %T in informer event", obj)
+	}
+
+	return resource, nil
+}
+
+// buildMessages translates an observed change into the messages that describe
+// it: a full reload unless IncrementalUpdate is enabled, otherwise the rules
+// that actually changed.
+func (w *Watcher) buildMessages(kind eventKind, oldObj, newObj *unstructured.Unstructured) []*MSG {
+	if !w.options.IncrementalUpdate {
+		return []*MSG{w.newMessage(Update)}
+	}
+
+	switch kind {
+	case eventAdd:
+		rules, err := extractRules(newObj)
+		if err != nil {
+			return w.reload(err)
+		}
+
+		return w.ruleMessages(rules, UpdateForAddPolicy, UpdateForAddPolicies)
+
+	case eventDelete:
+		rules, err := extractRules(oldObj)
+		if err != nil {
+			return w.reload(err)
+		}
+
+		return w.ruleMessages(rules, UpdateForRemovePolicy, UpdateForRemovePolicies)
+
+	case eventUpdate:
+		oldRules, err := extractRules(oldObj)
+		if err != nil {
+			return w.reload(err)
+		}
+
+		newRules, err := extractRules(newObj)
+		if err != nil {
+			return w.reload(err)
+		}
+
+		// Diffed rather than paired up: SelfUpdatePolicies needs both sides to
+		// hold the same number of rules, which a resource that gained or lost
+		// a line does not.
+		removed := w.ruleMessages(diffRules(newRules, oldRules), UpdateForRemovePolicy, UpdateForRemovePolicies)
+		added := w.ruleMessages(diffRules(oldRules, newRules), UpdateForAddPolicy, UpdateForAddPolicies)
+
+		return append(removed, added...)
+
+	default:
+		return nil
+	}
+}
+
+// reload reports why the change could not be described incrementally.
+func (w *Watcher) reload(err error) []*MSG {
+	log.Println("Falling back to a full policy reload:", err)
+	return []*MSG{w.newMessage(Update)}
+}
+
+// ruleMessages builds one message per section and policy type.
+func (w *Watcher) ruleMessages(rules []rule, single, batch UpdateType) []*MSG {
+	groups := groupRules(rules)
+	msgs := make([]*MSG, 0, len(groups))
+
+	for _, group := range groups {
+		msg := w.newMessage(single)
+		msg.Sec = group[0].sec
+		msg.Ptype = group[0].ptype
+
+		if len(group) == 1 {
+			msg.NewRule = group[0].fields
+		} else {
+			msg.Method = batch
+			msg.NewRules = ruleFields(group)
+		}
+
+		msgs = append(msgs, msg)
+	}
+
+	return msgs
+}
+
+func (w *Watcher) newMessage(method UpdateType) *MSG {
+	return &MSG{Method: method, ID: w.localID}
+}
+
+// notify hands one message to the callback. Calls are serialized so a change
+// made of several messages, such as a rule replacement, is applied in order.
+func (w *Watcher) notify(callback func(string), msg *MSG) {
 	msgBytes, err := msg.MarshalBinary()
 	if err != nil {
 		log.Println("Error marshaling message:", err)
 		return
 	}
+
+	w.callbackMu.Lock()
+	defer w.callbackMu.Unlock()
 
 	callback(string(msgBytes))
 }
